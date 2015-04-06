@@ -1560,8 +1560,6 @@ int FileStore::mount()
     }
   }
 
-  init_temp_collections();
-
   wbthrottle.start();
   sync_thread.create();
 
@@ -1595,6 +1593,8 @@ int FileStore::mount()
       goto close_current_fd;
     }
   }
+
+  init_temp_collections();
 
   journal_start();
 
