@@ -2989,7 +2989,7 @@ void RGWCompleteMultipart::execute()
   }
 
   parts = static_cast<RGWMultiCompleteUpload *>(parser.find_first("CompleteMultipartUpload"));
-  if (!parts || parts->parts.size() == 0) {
+  if (!parts || parts->parts.empty()) {
     ret = -ERR_MALFORMED_XML;
     return;
   }
