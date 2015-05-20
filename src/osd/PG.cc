@@ -4452,6 +4452,9 @@ void PG::append_log_entries_update_missing(
   if (on_local_complete)
     t->register_on_complete(on_local_complete);
 
+  assert(!entries.empty());
+  assert(entries.begin()->version > info.last_update);
+
   PGLogEntryHandler rollbacker;
   pg_log.append_new_log_entries(
     info.last_backfill,
@@ -4459,9 +4462,6 @@ void PG::append_log_entries_update_missing(
     &rollbacker);
   rollbacker.apply(this, t);
   info.last_update = pg_log.get_head();
-
-  assert(!entries.empty());
-  assert(entries.begin()->version > info.last_update);
 
   if (pg_log.get_missing().num_missing() == 0) {
     // advance last_complete since nothing else is missing!
