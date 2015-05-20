@@ -513,4 +513,12 @@ namespace librbd {
     wr->write(m_object_off, m_write_data);
     wr->set_op_flags2(m_op_flags);
   }
+
+  void AioRemove::guard_write() {
+    // do nothing to disable write guard only if deep-copyup not required
+    RWLock::RLocker snap_locker(m_ictx->snap_lock);
+    if (!m_ictx->snaps.empty()) {
+      AbstractWrite::guard_write();
+    }
+  }
 }
