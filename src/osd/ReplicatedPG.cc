@@ -44,6 +44,7 @@
 #include "messages/MOSDPGPush.h"
 #include "messages/MOSDPGPull.h"
 #include "messages/MOSDPGPushReply.h"
+#include "messages/MOSDPGUpdateLogMissing.h"
 
 #include "Watch.h"
 
@@ -1313,6 +1314,14 @@ void ReplicatedPG::do_request(
 
   case MSG_OSD_PG_BACKFILL:
     do_backfill(op);
+    break;
+
+  case MSG_OSD_REP_SCRUB:
+    replica_scrub(op, handle);
+    break;
+
+  case MSG_OSD_PG_UPDATE_LOG_MISSING:
+    do_update_log_missing(op);
     break;
 
   default:
@@ -2902,13 +2911,8 @@ ReplicatedPG::RepGather *ReplicatedPG::trim_object(const hobject_t &coid)
   return repop;
 }
 
-void ReplicatedPG::snap_trimmer()
+void ReplicatedPG::snap_trimmer(epoch_t queued)
 {
-  lock();
-  if (deleting) {
-    unlock();
-    return;
-  }
   if (g_conf->osd_snap_trim_sleep > 0) {
     unlock();
     utime_t t;
@@ -2917,13 +2921,16 @@ void ReplicatedPG::snap_trimmer()
     lock();
     dout(20) << __func__ << " slept for " << t << dendl;
   }
+  if (deleting || pg_has_reset_since(queued)) {
+    return;
+  }
+  snap_trim_queued = false;
   dout(10) << "snap_trimmer entry" << dendl;
   if (is_primary()) {
     entity_inst_t nobody;
     if (scrubber.active) {
       dout(10) << " scrubbing, will requeue snap_trimmer after" << dendl;
       scrubber.queue_snap_trim = true;
-      unlock();
       return;
     }
 
@@ -2940,7 +2947,6 @@ void ReplicatedPG::snap_trimmer()
     // replica collection trimming
     snap_trimmer_machine.process_event(SnapTrim());
   }
-  unlock();
   return;
 }
 
@@ -7265,16 +7271,20 @@ void ReplicatedPG::op_applied(const eversion_t &applied_version)
   if (is_primary()) {
     if (scrubber.active) {
       if (last_update_applied == scrubber.subset_last_update) {
-        osd->scrub_wq.queue(this);
+        requeue_scrub();
       }
     } else {
       assert(scrubber.start == scrubber.end);
     }
   } else {
     if (scrubber.active_rep_scrub) {
-      if (last_update_applied == scrubber.active_rep_scrub->scrub_to) {
-	osd->rep_scrub_wq.queue(scrubber.active_rep_scrub);
-	scrubber.active_rep_scrub = 0;
+      if (last_update_applied == static_cast<MOSDRepScrub*>(
+	    scrubber.active_rep_scrub->get_req())->scrub_to) {
+	osd->op_wq.queue(
+	  make_pair(
+	    this,
+	    scrubber.active_rep_scrub));
+	scrubber.active_rep_scrub = OpRequestRef();
       }
     }
   }
@@ -8125,7 +8135,7 @@ void ReplicatedPG::kick_object_context_blocked(ObjectContextRef obc)
   waiting_for_blocked_object.erase(p);
 
   if (obc->requeue_scrub_on_unblock)
-    osd->queue_for_scrub(this);
+    requeue_scrub();
 }
 
 SnapSetContext *ReplicatedPG::create_snapset_context(const hobject_t& oid)
@@ -8358,7 +8368,7 @@ void ReplicatedPG::_applied_recovered_object(ObjectContextRef obc)
   // requeue an active chunky scrub waiting on recovery ops
   if (!deleting && active_pushes == 0
       && scrubber.is_chunky_scrub_active()) {
-    osd->scrub_wq.queue(this);
+    requeue_scrub();
   }
 
   unlock();
@@ -8374,9 +8384,13 @@ void ReplicatedPG::_applied_recovered_object_replica()
 
   // requeue an active chunky scrub waiting on recovery ops
   if (!deleting && active_pushes == 0 &&
-      scrubber.active_rep_scrub && scrubber.active_rep_scrub->chunky) {
-    osd->rep_scrub_wq.queue(scrubber.active_rep_scrub);
-    scrubber.active_rep_scrub = 0;
+      scrubber.active_rep_scrub && static_cast<MOSDRepScrub*>(
+	scrubber.active_rep_scrub->get_req())->chunky) {
+    osd->op_wq.queue(
+      make_pair(
+	this,
+	scrubber.active_rep_scrub));
+    scrubber.active_rep_scrub = OpRequestRef();
   }
 
   unlock();
@@ -8507,17 +8521,19 @@ void ReplicatedPG::mark_all_unfound_lost(int what)
   pg_log.get_log().print(*_dout);
   *_dout << dendl;
 
-  ObjectStore::Transaction *t = new ObjectStore::Transaction;
-  C_PG_MarkUnfoundLost *c = new C_PG_MarkUnfoundLost(this);
+  list<pg_log_entry_t> log_entries;
 
   utime_t mtime = ceph_clock_now(cct);
   info.last_update.epoch = get_osdmap()->get_epoch();
-  const pg_missing_t &missing = pg_log.get_missing();
   map<hobject_t, pg_missing_t::item>::const_iterator m =
     missing_loc.get_needs_recovery().begin();
   map<hobject_t, pg_missing_t::item>::const_iterator mend =
     missing_loc.get_needs_recovery().end();
+
+  C_PG_MarkUnfoundLost *c = new C_PG_MarkUnfoundLost(this);
+  eversion_t v = info.last_update;
   while (m != mend) {
+    ++v.version;
     const hobject_t &oid(m->first);
     if (!missing_loc.is_unfound(oid)) {
       // We only care about unfound objects
@@ -8530,10 +8546,7 @@ void ReplicatedPG::mark_all_unfound_lost(int what)
 
     switch (what) {
     case pg_log_entry_t::LOST_MARK:
-      obc = mark_object_lost(t, oid, m->second.need, mtime, pg_log_entry_t::LOST_MARK);
-      pg_log.missing_got(m++);
       assert(0 == "actually, not implemented yet!");
-      // we need to be careful about how this is handled on the replica!
       break;
 
     case pg_log_entry_t::LOST_REVERT:
@@ -8542,33 +8555,26 @@ void ReplicatedPG::mark_all_unfound_lost(int what)
 	// log it
 	++info.last_update.version;
 	pg_log_entry_t e(
-	  pg_log_entry_t::LOST_REVERT, oid, info.last_update,
+	  pg_log_entry_t::LOST_REVERT, oid, v,
 	  m->second.need, 0, osd_reqid_t(), mtime);
 	e.reverting_to = prev;
-	pg_log.add(e);
+	log_entries.push_back(e);
 	dout(10) << e << dendl;
 
 	// we are now missing the new version; recovery code will sort it out.
 	++m;
-	pg_log.revise_need(oid, info.last_update);
-	missing_loc.revise_need(oid, info.last_update);
+	missing_loc.revise_need(oid, v);
 	break;
       }
       /** fall-thru **/
 
     case pg_log_entry_t::LOST_DELETE:
       {
-	// log it
-      	++info.last_update.version;
-	pg_log_entry_t e(pg_log_entry_t::LOST_DELETE, oid, info.last_update, m->second.need,
+	pg_log_entry_t e(pg_log_entry_t::LOST_DELETE, oid, v, m->second.need,
 		     0, osd_reqid_t(), mtime);
-	pg_log.add(e);
+	log_entries.push_back(e);
 	dout(10) << e << dendl;
 
-	t->remove(
-	  coll,
-	  ghobject_t(oid, ghobject_t::NO_GEN, pg_whoami.shard));
-	pg_log.missing_add_event(e);
 	++m;
 	missing_loc.recovered(oid);
       }
@@ -8582,27 +8588,11 @@ void ReplicatedPG::mark_all_unfound_lost(int what)
       c->obcs.push_back(obc);
   }
 
-  dout(30) << __func__ << ": log after:\n";
-  pg_log.get_log().print(*_dout);
-  *_dout << dendl;
-
   info.stats.stats_invalid = true;
 
-  if (missing.num_missing() == 0) {
-    // advance last_complete since nothing else is missing!
-    info.last_complete = info.last_update;
-  }
-
-  dirty_info = true;
-  write_if_dirty(*t);
-
-  t->register_on_complete(new ObjectStore::C_DeleteTransaction(t));
-
-  osd->store->queue_transaction(osr.get(), t, c, NULL, new C_OSD_OndiskWriteUnlockList(&c->obcs));
-	      
   // Send out the PG log to all replicas
   // So that they know what is lost
-  share_pg_log();
+  share_new_log_entries(log_entries, c);
 
   // queue ourselves so that we push the (now-lost) object_infos to replicas.
   osd->queue_for_recovery(this);
@@ -8738,7 +8728,6 @@ void ReplicatedPG::on_shutdown()
 
   // remove from queues
   osd->recovery_wq.dequeue(this);
-  osd->snap_trim_wq.dequeue(this);
   osd->pg_stat_queue_dequeue(this);
   osd->dequeue_pg(this, 0);
   osd->peering_wq.dequeue(this);
@@ -11187,7 +11176,7 @@ void ReplicatedPG::_scrub_digest_updated()
 {
   dout(20) << __func__ << dendl;
   if (--scrubber.num_digest_updates_pending == 0) {
-    osd->scrub_wq.queue(this);
+    requeue_scrub();
   }
 }
 
