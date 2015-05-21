@@ -703,6 +703,8 @@ ConnectionRef OSDService::get_con_osd_cluster(int peer, epoch_t from_epoch)
   }
   ConnectionRef con = osd->cluster_messenger->get_connection(next_map->get_cluster_inst(peer));
   release_map(next_map);
+  if (con->get_features() == 0)
+    return NULL;
   return con;
 }
 
