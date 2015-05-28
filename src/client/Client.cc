@@ -1634,7 +1634,7 @@ int Client::encode_inode_release(Inode *in, MetaRequest *req,
   int released = 0;
   if (in->caps.count(mds)) {
     Cap *caps = in->caps[mds];
-    drop &= ~(in->dirty_caps | get_caps_used(in));
+    drop &= ~(in->caps_dirty() | get_caps_used(in));
     if ((drop & caps->issued) &&
 	!(unless & caps->issued)) {
       ldout(cct, 25) << "Dropping caps. Initial " << ccap_string(caps->issued) << dendl;
@@ -3080,7 +3080,8 @@ void Client::check_caps(Inode *in, bool is_delayed)
     else
       flushing = 0;
 
-    send_cap(in, session, cap, cap_used, wanted, retain, flushing);
+    send_cap(in, session, cap, (cap_used | in->caps_dirty()),
+	     wanted, retain, flushing);
   }
 }
 
@@ -3754,8 +3755,9 @@ void Client::flush_caps(Inode *in, MetaSession *session)
   Cap *cap = in->auth_cap;
   assert(cap->session == session);
 
-  send_cap(in, session, cap, get_caps_used(in), in->caps_wanted(),
-	   (cap->issued | cap->implemented), in->flushing_caps);
+  send_cap(in, session, cap, (get_caps_used(in) | in->caps_dirty()),
+	   in->caps_wanted(), (cap->issued | cap->implemented),
+	   in->flushing_caps);
 }
 
 void Client::wait_sync_caps(uint64_t want)
@@ -4316,6 +4318,7 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, MCl
 	num_flushing_caps--;
 	sync_cond.Signal();
       }
+      check_caps(in, false);
       if (!in->caps_dirty())
 	put_inode(in);
     }
