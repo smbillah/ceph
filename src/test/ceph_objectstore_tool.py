@@ -1224,7 +1224,7 @@ def main(argv):
         time.sleep(5)
         wait_for_health()
 
-        time.sleep(15)
+        time.sleep(20)
 
         kill_daemons()
 
